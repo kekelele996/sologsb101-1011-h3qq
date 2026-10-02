@@ -1,5 +1,7 @@
 /**
  * 定线 store：维护水位流量关系点据、比测记录、定线参数与残差派生值。
+ * 点据按（定线号 + 涨落标记）分成两支分别拟合，残差与比测偏差按所在支线计算。
+ * 定线发布后留住当时的版本与比测结论，重新拟合另出新版本。
  * 供关系点据页（/ratings）与导出页（/export）共用。
  */
 import { defineStore } from 'pinia'
@@ -9,18 +11,27 @@ import type { Compare } from '@/types/compare'
 import { DEVIATION_LIMIT_PCT, calcDeviationPct, judgeDeviation, type CompareRow } from '@/types/compare'
 import type { Rating, RatingFitResult } from '@/types/rating'
 import { createEmptyRatingFilter, curveFlow, fitPowerCurve, type RatingFilterState } from '@/types/rating'
+import type { RiseFall } from '@/types/section'
+import { RISE_FALL_LABELS } from '@/types/section'
 import type { Station } from '@/types/station'
+import type { RatingVersion, VersionCompareSnapshot, VersionFitSnapshot } from '@/types/ratingVersion'
+import { nextVersionNumber } from '@/types/ratingVersion'
+
+/** 支线拟合结果：涨落标记 + 拟合参数 */
+export interface BranchFit extends RatingFitResult {
+  riseFall: RiseFall | null
+}
 
 export const useRatingStore = defineStore('rating', () => {
   const ratings = ref<Rating[]>([])
   const compares = ref<Compare[]>([])
   const stations = ref<Station[]>([])
+  const versions = ref<RatingVersion[]>([])
   const ready = ref(false)
   const error = ref<string | null>(null)
   const filter = ref<RatingFilterState>(createEmptyRatingFilter())
-  /** 当前定线号与定线参数（跨页保留） */
+  /** 当前定线号（跨页保留） */
   const activeLineNo = ref<string>('A')
-  const fits = ref<RatingFitResult[]>([])
   const deviationLimitPct = ref<number>(DEVIATION_LIMIT_PCT)
 
   let started = false
@@ -39,6 +50,9 @@ export const useRatingStore = defineStore('rating', () => {
     watchTable<Station>(() => db.stations).subscribe((rows) => {
       stations.value = rows
     })
+    watchTable<RatingVersion>(() => db.ratingVersions).subscribe((rows) => {
+      versions.value = rows
+    })
   }
 
   const lineNos = computed<string[]>(() => {
@@ -50,36 +64,57 @@ export const useRatingStore = defineStore('rating', () => {
   const stationNameOf = (stationId: string): string =>
     stations.value.find((station) => station.id === stationId)?.name ?? '未知测站'
 
-  /** 逐定线号的拟合结果（幂函数定线） */
-  const allFits = computed<RatingFitResult[]>(() =>
-    lineNos.value.map((lineNo) => {
-      const points = ratings.value
-        .filter((rating) => rating.lineNo === lineNo)
-        .map((rating) => ({ stageM: rating.stageM, flowM3s: rating.flowM3s }))
-      return fitPowerCurve(points, lineNo)
+  /** 按（定线号 + 涨落标记）分组的支线拟合结果 */
+  const branchFits = computed<BranchFit[]>(() => {
+    const groups = new Map<string, { lineNo: string; riseFall: RiseFall | null; points: Rating[] }>()
+    ratings.value.forEach((rating) => {
+      const key = `${rating.lineNo}__${rating.riseFall ?? 'null'}`
+      if (!groups.has(key)) {
+        groups.set(key, { lineNo: rating.lineNo, riseFall: rating.riseFall, points: [] })
+      }
+      groups.get(key)!.points.push(rating)
     })
+    return Array.from(groups.values()).map((group) => ({
+      ...fitPowerCurve(
+        group.points.map((rating) => ({ stageM: rating.stageM, flowM3s: rating.flowM3s })),
+        group.lineNo,
+        group.riseFall
+      )
+    }))
+  })
+
+  /** 当前定线号下的支线拟合结果 */
+  const activeBranchFits = computed<BranchFit[]>(() =>
+    branchFits.value
+      .filter((fit) => fit.lineNo === activeLineNo.value)
+      .sort((a, b) => {
+        const order: Record<string, number> = { rising: 0, falling: 1, null: 2 }
+        return (order[a.riseFall ?? 'null'] ?? 2) - (order[b.riseFall ?? 'null'] ?? 2)
+      })
   )
 
+  /** 当前定线号的拟合结果（取首个有效支线，兼容旧调用） */
   const activeFit = computed<RatingFitResult>(() => {
-    const cached = fits.value.find((fit) => fit.lineNo === activeLineNo.value)
-    if (cached) return cached
-    const computedFit = allFits.value.find((fit) => fit.lineNo === activeLineNo.value)
-    if (computedFit) return computedFit
+    const found = activeBranchFits.value.find((fit) => fit.valid) ?? activeBranchFits.value[0]
+    if (found) return found
     return fitPowerCurve([], activeLineNo.value)
   })
 
-  /** 点据 + 曲线流量 + 残差 */
+  /** 点据 + 所在支线曲线流量 + 残差 + 判定 */
   const pointRows = computed(() =>
     ratings.value
       .filter((rating) => rating.lineNo === activeLineNo.value)
       .sort((a, b) => a.stageM - b.stageM)
       .map((rating) => {
-        const predicted = activeFit.value.valid ? curveFlow(activeFit.value, rating.stageM) : 0
+        const branchFit = activeBranchFits.value.find((fit) => fit.riseFall === rating.riseFall)
+        const predicted = branchFit?.valid ? curveFlow(branchFit, rating.stageM) : 0
         const residualPct =
-          activeFit.value.valid && rating.flowM3s > 0
+          branchFit?.valid && rating.flowM3s > 0
             ? Number((((rating.flowM3s - predicted) / rating.flowM3s) * 100).toFixed(2))
             : 0
-        return { rating, predicted, residualPct }
+        const compare = compares.value.find((item) => item.ratingId === rating.id)
+        const verdict = compare?.verdict ?? (Math.abs(residualPct) > deviationLimitPct.value ? '超限' : '合格')
+        return { rating, predicted, residualPct, branchFit: branchFit ?? null, verdict }
       })
   )
 
@@ -130,7 +165,7 @@ export const useRatingStore = defineStore('rating', () => {
 
   /** 定线质量派生值：平均残差与合格点占比 */
   const fitQuality = computed(() => {
-    const valid = allFits.value.filter((fit) => fit.valid)
+    const valid = branchFits.value.filter((fit) => fit.valid)
     const meanResidual = valid.length
       ? Number((valid.reduce((sum, fit) => sum + fit.meanResidualPct, 0) / valid.length).toFixed(2))
       : 0
@@ -145,6 +180,15 @@ export const useRatingStore = defineStore('rating', () => {
     }
   })
 
+  /** 已定线号的发布版本（按版本号倒序） */
+  const versionsOfLine = (lineNo: string): RatingVersion[] =>
+    versions.value
+      .filter((version) => version.lineNo === lineNo)
+      .sort((a, b) => b.version - a.version)
+
+  /** 当前定线号的最新发布版本 */
+  const latestVersionOfLine = (lineNo: string): RatingVersion | null => versionsOfLine(lineNo)[0] ?? null
+
   function patchFilter(patch: Partial<RatingFilterState>): void {
     filter.value = { ...filter.value, ...patch }
   }
@@ -155,11 +199,6 @@ export const useRatingStore = defineStore('rating', () => {
 
   function setActiveLine(lineNo: string): void {
     activeLineNo.value = lineNo
-  }
-
-  function setFit(fit: RatingFitResult): void {
-    const others = fits.value.filter((item) => item.lineNo !== fit.lineNo)
-    fits.value = [...others, fit]
   }
 
   function setDeviationLimit(limit: number): void {
@@ -187,23 +226,30 @@ export const useRatingStore = defineStore('rating', () => {
   }
 
   /**
-   * 由点据生成 / 刷新比测记录：曲线流量取当前定线拟合值，
+   * 由点据生成 / 刷新比测记录：曲线流量取所在支线的拟合值，
    * 偏差超过限值自动判定超限并进入分析清单。
    */
   async function rebuildCompares(lineNo?: string): Promise<number> {
     const targetLine = lineNo ?? activeLineNo.value
-    const fit = fitPowerCurve(
-      ratings.value
-        .filter((rating) => rating.lineNo === targetLine)
-        .map((rating) => ({ stageM: rating.stageM, flowM3s: rating.flowM3s })),
-      targetLine
-    )
-    setFit(fit)
-    const targets = ratings.value.filter((rating) => rating.lineNo === targetLine)
-    if (targets.length === 0) return 0
+    const lineRatings = ratings.value.filter((rating) => rating.lineNo === targetLine)
+    if (lineRatings.length === 0) return 0
+
+    // 按支线分组拟合
+    const branchMap = new Map<string, BranchFit>()
+    lineRatings.forEach((rating) => {
+      const key = rating.riseFall ?? 'null'
+      if (!branchMap.has(key)) {
+        const points = lineRatings
+          .filter((item) => (item.riseFall ?? 'null') === key)
+          .map((item) => ({ stageM: item.stageM, flowM3s: item.flowM3s }))
+        branchMap.set(key, { ...fitPowerCurve(points, targetLine, rating.riseFall) })
+      }
+    })
+
     const now = Date.now()
-    const rows: Compare[] = targets.map((rating) => {
-      const predicted = fit.valid ? curveFlow(fit, rating.stageM) : rating.flowM3s
+    const rows: Compare[] = lineRatings.map((rating) => {
+      const branchFit = branchMap.get(rating.riseFall ?? 'null')
+      const predicted = branchFit?.valid ? curveFlow(branchFit, rating.stageM) : rating.flowM3s
       const deviationPct = calcDeviationPct(rating.flowM3s, predicted)
       const existing = compares.value.find((item) => item.ratingId === rating.id)
       return {
@@ -221,6 +267,81 @@ export const useRatingStore = defineStore('rating', () => {
     })
     await db.compares.bulkPut(rows)
     return rows.length
+  }
+
+  /**
+   * 发布定线：留住当前定线号下各支线的拟合成果与比测结论，
+   * 生成不可变的发布版本。重新拟合后需再次发布才会刷新版本。
+   */
+  async function publishVersion(lineNo: string, note = ''): Promise<RatingVersion> {
+    const targetLine = lineNo
+    const lineRatings = ratings.value.filter((rating) => rating.lineNo === targetLine)
+    if (lineRatings.length === 0) {
+      throw new Error('当前定线号下没有点据，无法发布')
+    }
+
+    // 确保比测记录是最新的
+    await rebuildCompares(targetLine)
+
+    // 支线拟合快照
+    const fits: VersionFitSnapshot[] = branchFits.value
+      .filter((fit) => fit.lineNo === targetLine)
+      .map((fit) => ({
+        riseFall: fit.riseFall,
+        a: fit.a,
+        b: fit.b,
+        h0: fit.h0,
+        sampleCount: fit.sampleCount,
+        meanResidualPct: fit.meanResidualPct,
+        maxResidualPct: fit.maxResidualPct,
+        r2: fit.r2,
+        valid: fit.valid,
+        message: fit.message
+      }))
+
+    // 比测记录快照
+    const lineRatingIds = new Set(lineRatings.map((rating) => rating.id))
+    const lineCompares = compares.value.filter((compare) => lineRatingIds.has(compare.ratingId))
+    const compareSnapshots: VersionCompareSnapshot[] = lineCompares.map((compare) => {
+      const rating = lineRatings.find((item) => item.id === compare.ratingId)
+      return {
+        ratingId: compare.ratingId,
+        measureNo: rating?.measureNo ?? '',
+        riseFall: rating?.riseFall ?? null,
+        measuredFlow: compare.measuredFlow,
+        curveFlow: compare.curveFlow,
+        deviationPct: compare.deviationPct,
+        verdict: compare.verdict
+      }
+    })
+
+    const overLimit = compareSnapshots.filter((item) => item.verdict === '超限').length
+    const total = compareSnapshots.length
+    const versionNumber = nextVersionNumber(versions.value, targetLine)
+    const now = Date.now()
+    const row: RatingVersion = {
+      id: createId('rver'),
+      lineNo: targetLine,
+      version: versionNumber,
+      publishedAt: new Date().toISOString(),
+      fits,
+      compares: compareSnapshots,
+      compareSummary: {
+        total,
+        overLimit,
+        qualifyRatePct: total === 0 ? 0 : Number((((total - overLimit) / total) * 100).toFixed(1))
+      },
+      note: note.trim(),
+      createdAt: now,
+      updatedAt: now
+    }
+    await db.ratingVersions.put(row)
+    return row
+  }
+
+  /** 删除发布版本（仅删除版本快照，不影响点据与比测记录） */
+  async function removeVersion(id: string): Promise<void> {
+    await db.ratingVersions.delete(id)
   }
 
   /** 手工登记比测记录（导出页分析清单用） */
@@ -253,19 +374,25 @@ export const useRatingStore = defineStore('rating', () => {
     await db.compares.delete(id)
   }
 
+  /** 涨落标记中文文案 */
+  function riseFallLabel(riseFall: RiseFall | null): string {
+    return riseFall ? RISE_FALL_LABELS[riseFall] : '未标记'
+  }
+
   return {
     ratings,
     compares,
     stations,
+    versions,
     ready,
     error,
     filter,
     activeLineNo,
     activeFit,
-    fits,
+    activeBranchFits,
     deviationLimitPct,
     lineNos,
-    allFits,
+    branchFits,
     pointRows,
     filteredRatings,
     hasFilter,
@@ -274,15 +401,19 @@ export const useRatingStore = defineStore('rating', () => {
     fitQuality,
     start,
     stationNameOf,
+    versionsOfLine,
+    latestVersionOfLine,
+    riseFallLabel,
     patchFilter,
     resetFilter,
     setActiveLine,
-    setFit,
     setDeviationLimit,
     createRating,
     updateRating,
     removeRating,
     rebuildCompares,
+    publishVersion,
+    removeVersion,
     createCompare,
     updateCompare,
     removeCompare

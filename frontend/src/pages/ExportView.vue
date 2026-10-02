@@ -33,6 +33,8 @@ import {
   validateBackup
 } from '@/utils/export'
 import { fitPowerCurve } from '@/types/rating'
+import { RISE_FALL_LABELS, riseFallLabelOf } from '@/types/section'
+import RiseFallTag from '@/components/common/RiseFallTag.vue'
 
 const ratingStore = useRatingStore()
 const stationStore = useStationStore()
@@ -48,6 +50,11 @@ const exporting = ref(false)
 
 const compareRows = computed(() => ratingStore.compareRows)
 const overLimitRows = computed(() => ratingStore.overLimitRows)
+
+/** 已发布版本（全部定线号，按发布时间倒序） */
+const allVersions = computed(() =>
+  [...ratingStore.versions].sort((a, b) => Date.parse(b.publishedAt) - Date.parse(a.publishedAt))
+)
 
 /** 检测结论：按测站汇总测次、最新水位、定线参数与超限点据 */
 const conclusions = ref<
@@ -71,14 +78,17 @@ async function refreshCounts(): Promise<void> {
 
 async function buildConclusions(): Promise<void> {
   const payload = await buildBackupPayload()
-  const fits = ratingStore.lineNos.map((lineNo) =>
-    fitPowerCurve(
-      payload.ratings
-        .filter((rating) => rating.lineNo === lineNo)
-        .map((rating) => ({ stageM: rating.stageM, flowM3s: rating.flowM3s })),
-      lineNo
-    )
-  )
+  // 按（定线号 + 涨落支线）分别拟合
+  const branchKeys = new Set<string>()
+  payload.ratings.forEach((rating) => branchKeys.add(`${rating.lineNo}__${rating.riseFall ?? 'null'}`))
+  const fits = Array.from(branchKeys).map((key) => {
+    const [lineNo, riseFallKey] = key.split('__')
+    const riseFall = riseFallKey === 'null' ? null : (riseFallKey as 'rising' | 'falling')
+    const points = payload.ratings
+      .filter((rating) => rating.lineNo === lineNo && (rating.riseFall ?? null) === riseFall)
+      .map((rating) => ({ stageM: rating.stageM, flowM3s: rating.flowM3s }))
+    return { ...fitPowerCurve(points, lineNo, riseFall), riseFall }
+  })
   conclusions.value = buildConclusionLines(payload, fits)
 }
 
@@ -253,6 +263,11 @@ onMounted(() => {
             <el-tag size="small" effect="plain">{{ row.lineNo }}</el-tag>
           </template>
         </el-table-column>
+        <el-table-column label="涨落" width="90" align="center">
+          <template #default="{ row }">
+            <RiseFallTag :rise-fall="row.rating?.riseFall ?? null" />
+          </template>
+        </el-table-column>
         <el-table-column label="水位 (m)" width="110" align="right">
           <template #default="{ row }">
             <span class="gb-mono">{{ row.rating ? row.rating.stageM.toFixed(2) : '—' }}</span>
@@ -286,11 +301,53 @@ onMounted(() => {
       </el-table>
     </el-card>
 
+    <el-card v-if="allVersions.length > 0" shadow="never" class="gb-panel">
+      <div class="gb-panel-title">
+        <h3>定线发布版本</h3>
+        <span class="gb-hint">每次发布留住当时的支线成果与比测结论，共 {{ allVersions.length }} 个版本</span>
+      </div>
+      <el-table :data="allVersions" border size="small" class="gb-table-compact">
+        <el-table-column label="定线号" width="90" align="center">
+          <template #default="{ row }">
+            <el-tag size="small" effect="plain">{{ row.lineNo }} 线</el-tag>
+          </template>
+        </el-table-column>
+        <el-table-column label="版本" width="80" align="center">
+          <template #default="{ row }">
+            <el-tag size="small" type="success" effect="plain">v{{ row.version }}</el-tag>
+          </template>
+        </el-table-column>
+        <el-table-column label="发布时间" width="170">
+          <template #default="{ row }">
+            <span class="gb-mono">{{ new Date(row.publishedAt).toLocaleString('zh-CN') }}</span>
+          </template>
+        </el-table-column>
+        <el-table-column label="支线成果" min-width="260">
+          <template #default="{ row }">
+            <span v-for="fit in row.fits" :key="fit.riseFall ?? 'null'" class="page__version-fit">
+              <el-tag size="small" effect="plain">
+                {{ riseFallLabelOf(fit.riseFall) }}:
+                Q={{ fit.valid ? `${fit.a}·(H-${fit.h0})^${fit.b}` : '未定线' }}
+              </el-tag>
+            </span>
+          </template>
+        </el-table-column>
+        <el-table-column label="比测结论" width="200">
+          <template #default="{ row }">
+            <span class="gb-mono">
+              {{ row.compareSummary.total }} 点 / 超限 {{ row.compareSummary.overLimit }} / 合格率 {{ row.compareSummary.qualifyRatePct }}%
+            </span>
+          </template>
+        </el-table-column>
+        <el-table-column prop="note" label="发布说明" min-width="120" show-overflow-tooltip />
+      </el-table>
+    </el-card>
+
     <el-card shadow="never" class="gb-panel">
       <div class="gb-panel-title">
         <h3>全量 JSON 导入导出</h3>
         <span class="gb-hint">
-          导出内容包含 stations / sections / verticals / points / ratings / compares 六张表
+          导出内容包含 stations / sections / verticals / points / ratings / compares / ratingVersions 七张表
         </span>
       </div>
 
@@ -334,6 +391,9 @@ onMounted(() => {
         <el-descriptions-item label="点据 / 比测">
           {{ counts.ratings ?? 0 }} / {{ counts.compares ?? 0 }}
         </el-descriptions-item>
+        <el-descriptions-item label="发布版本">
+          {{ counts.ratingVersions ?? 0 }}
+        </el-descriptions-item>
         <el-descriptions-item label="最近备份时间">
           {{ lastBackupAt ? new Date(lastBackupAt).toLocaleString('zh-CN') : '尚未备份' }}
         </el-descriptions-item>
@@ -372,5 +432,9 @@ onMounted(() => {
 .page__danger {
   color: #c0392b;
   font-weight: 700;
+}
+
+.page__version-fit {
+  margin-right: 6px;
 }
 </style>

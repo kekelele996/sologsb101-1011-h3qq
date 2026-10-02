@@ -1,3 +1,5 @@
+import type { RiseFall } from './section'
+
 /** 水位流量关系点据：参与幂函数定线的实测点 */
 export interface Rating {
   id: string
@@ -9,6 +11,8 @@ export interface Rating {
   flowM3s: number
   /** 定线号：同一定线号的点据参与同一组拟合 */
   lineNo: string
+  /** 涨落标记：涨水 / 落水；按标记分成两支分别拟合 */
+  riseFall: RiseFall | null
   /** 点据来源测次号 */
   measureNo: string
   /** 点据时间 */
@@ -20,6 +24,8 @@ export interface Rating {
 /** 幂函数定线结果：Q = a * (H - H0)^b */
 export interface RatingFitResult {
   lineNo: string
+  /** 涨落支线：涨水 / 落水；为空表示未标记支线 */
+  riseFall: RiseFall | null
   /** 系数 a */
   a: number
   /** 指数 b */
@@ -91,13 +97,15 @@ function fitWithBase(
  */
 export function fitPowerCurve(
   points: Array<{ stageM: number; flowM3s: number }>,
-  lineNo = 'A'
+  lineNo = 'A',
+  riseFall: RiseFall | null = null
 ): RatingFitResult {
   const usable = points.filter(
     (point) => Number.isFinite(point.stageM) && Number.isFinite(point.flowM3s) && point.flowM3s > 0
   )
   const base: RatingFitResult = {
     lineNo,
+    riseFall,
     a: 0,
     b: 0,
     h0: 0,
@@ -146,6 +154,7 @@ export function fitPowerCurve(
   const valid = best.b > 0 && Number.isFinite(best.a)
   return {
     lineNo,
+    riseFall,
     a: Number(best.a.toFixed(4)),
     b: Number(best.b.toFixed(3)),
     h0: Number(best.h0.toFixed(3)),

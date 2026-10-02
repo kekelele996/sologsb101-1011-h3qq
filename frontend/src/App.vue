@@ -116,7 +116,7 @@ function go(path: string): void {
       <span>
         测站 {{ stationStore.stations.length }} · 测次 {{ sectionStore.sections.length }} · 垂线
         {{ sectionStore.verticals.length }} · 测点 {{ sectionStore.points.length }} · 点据
-        {{ ratingStore.ratings.length }}
+        {{ ratingStore.ratings.length }} · 发布版本 {{ ratingStore.versions.length }}
       </span>
     </footer>
   </div>

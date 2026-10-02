@@ -14,7 +14,8 @@ import EmptyPanel from '@/components/common/EmptyPanel.vue'
 import RouteMissingPanel from '@/components/common/RouteMissingPanel.vue'
 import { useStationStore } from '@/stores/stationStore'
 import { useSectionStore } from '@/stores/sectionStore'
-import { MEASURE_METHODS, type MeasureMethod, type Section } from '@/types/section'
+import { MEASURE_METHODS, RISE_FALLS, RISE_FALL_LABELS, type MeasureMethod, type RiseFall, type Section } from '@/types/section'
+import RiseFallTag from '@/components/common/RiseFallTag.vue'
 import { initDatabase } from '@/utils/db'
 
 const route = useRoute()
@@ -33,6 +34,7 @@ const form = reactive({
   startDistanceM: 0,
   stageM: 0,
   method: '流速仪' as MeasureMethod,
+  riseFall: null as RiseFall | null,
   measuredAt: new Date().toISOString().slice(0, 16)
 })
 
@@ -73,6 +75,11 @@ const stats = computed(() => {
   }
 })
 
+/** 未标记涨落的测次数（升级时按测流时间回填后仍无法判定的） */
+const unmarkedCount = computed(() =>
+  sectionStore.sectionsOfStation(stationId.value).filter((section) => section.riseFall === null).length
+)
+
 function openCreate(): void {
   editingId.value = null
   form.measureNo = `${new Date().getFullYear()}-${String(new Date().getMonth() + 1).padStart(2, '0')}-${String(
@@ -81,6 +88,7 @@ function openCreate(): void {
   form.startDistanceM = stats.value.latest?.startDistanceM ?? 0
   form.stageM = stats.value.latest?.stageM ?? 0
   form.method = '流速仪'
+  form.riseFall = null
   form.measuredAt = new Date().toISOString().slice(0, 16)
   dialogVisible.value = true
 }
@@ -91,6 +99,7 @@ function openEdit(section: Section): void {
   form.startDistanceM = section.startDistanceM
   form.stageM = section.stageM
   form.method = section.method
+  form.riseFall = section.riseFall
   form.measuredAt = section.measuredAt.slice(0, 16)
   dialogVisible.value = true
 }
@@ -120,6 +129,7 @@ async function submitForm(): Promise<void> {
       startDistanceM: form.startDistanceM,
       stageM: form.stageM,
       method: form.method,
+      riseFall: form.riseFall,
       measuredAt: new Date(form.measuredAt).toISOString()
     }
     if (editingId.value) {
@@ -262,6 +272,15 @@ onMounted(() => {
         </template>
       </FilterBar>
 
+      <el-alert
+        v-if="unmarkedCount > 0"
+        type="warning"
+        show-icon
+        :closable="false"
+        class="page__unmarked"
+        :title="`有 ${unmarkedCount} 个测次未标记涨落，无法参与绳套曲线支线拟合，请编辑测次补标涨水或落水`"
+      />
+
       <EmptyPanel
         v-if="sectionRows.length === 0"
         :title="sectionStore.sectionsOfStation(stationId).length === 0 ? '该测站还没有测次' : '没有符合条件的测次'"
@@ -279,6 +298,11 @@ onMounted(() => {
             <el-tag size="small" :type="row.method === 'ADCP' ? 'success' : row.method === '浮标' ? 'warning' : 'primary'" effect="plain">
               {{ row.method }}
             </el-tag>
+          </template>
+        </el-table-column>
+        <el-table-column label="涨落" width="90" align="center">
+          <template #default="{ row }">
+            <RiseFallTag :rise-fall="row.riseFall" />
           </template>
         </el-table-column>
         <el-table-column label="水位 (m)" width="110" align="right">
@@ -330,6 +354,15 @@ onMounted(() => {
           <el-radio-group v-model="form.method">
             <el-radio-button v-for="method in MEASURE_METHODS" :key="method" :value="method">{{ method }}</el-radio-button>
           </el-radio-group>
+        </el-form-item>
+        <el-form-item label="涨落标记">
+          <el-radio-group v-model="form.riseFall">
+            <el-radio-button v-for="riseFall in RISE_FALLS" :key="riseFall" :value="riseFall">
+              {{ RISE_FALL_LABELS[riseFall] }}
+            </el-radio-button>
+            <el-radio-button :value="null">未标记</el-radio-button>
+          </el-radio-group>
+          <p class="gb-hint">涨水 / 落水标记是绳套曲线分两支定线的依据，留空则该测次暂不参与支线拟合。</p>
         </el-form-item>
         <el-form-item label="水位" required>
           <el-input-number v-model="form.stageM" :min="-50" :max="200" :step="0.01" :precision="2" controls-position="right" />
@@ -386,5 +419,9 @@ onMounted(() => {
   margin-left: 8px;
   font-size: 12px;
   color: #8194a2;
+}
+
+.page__unmarked {
+  margin: 0;
 }
 </style>

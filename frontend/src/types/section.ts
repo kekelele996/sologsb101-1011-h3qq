@@ -3,6 +3,28 @@ export type MeasureMethod = '流速仪' | '浮标' | 'ADCP'
 
 export const MEASURE_METHODS: MeasureMethod[] = ['流速仪', '浮标', 'ADCP']
 
+/** 涨落标记：涨水 / 落水（绳套曲线按涨落两支分别定线） */
+export type RiseFall = 'rising' | 'falling'
+
+export const RISE_FALLS: RiseFall[] = ['rising', 'falling']
+
+/** 涨落标记中文文案 */
+export const RISE_FALL_LABELS: Record<RiseFall, string> = {
+  rising: '涨水',
+  falling: '落水'
+}
+
+/** 涨落标记标签类型（用于 el-tag 配色） */
+export const RISE_FALL_TAG_TYPES: Record<RiseFall, 'danger' | 'primary'> = {
+  rising: 'danger',
+  falling: 'primary'
+}
+
+/** 涨落标记中文文案（空值返回「未标记」） */
+export function riseFallLabelOf(riseFall: RiseFall | null | undefined): string {
+  return riseFall ? RISE_FALL_LABELS[riseFall] : '未标记'
+}
+
 /** 断面测次：一次完整的流量测验 */
 export interface Section {
   id: string
@@ -16,6 +38,8 @@ export interface Section {
   stageM: number
   /** 流速仪 / 浮标 / ADCP */
   method: MeasureMethod
+  /** 涨落标记：涨水 / 落水；未标记为空 */
+  riseFall: RiseFall | null
   /** 测流时间 */
   measuredAt: string
   createdAt: number

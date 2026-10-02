@@ -7,17 +7,18 @@
  */
 import Dexie, { liveQuery, type Table } from 'dexie'
 import type { Station } from '@/types/station'
-import type { Section } from '@/types/section'
+import type { Section, RiseFall } from '@/types/section'
 import type { Vertical } from '@/types/vertical'
 import type { Point } from '@/types/point'
 import type { Rating } from '@/types/rating'
 import type { Compare } from '@/types/compare'
+import type { RatingVersion } from '@/types/ratingVersion'
 import { calcDeviationPct, judgeDeviation } from '@/types/compare'
 import { fitPowerCurve } from '@/types/rating'
 import { calcMeanVelocity, DEFAULT_WEIGHTS, round } from '@/utils/flow'
 
 /** 当前数据结构版本号：每次调整字段结构必须 +1 并补迁移 */
-export const DB_VERSION = 2
+export const DB_VERSION = 3
 
 /** 数据库名（浏览器 IndexedDB 中的库名） */
 export const DB_NAME = 'gbhydrogaug'
@@ -40,6 +41,7 @@ export interface BackupPayload {
   points: Point[]
   ratings: Rating[]
   compares: Compare[]
+  ratingVersions: RatingVersion[]
 }
 
 class HydroGaugeDatabase extends Dexie {
@@ -49,6 +51,7 @@ class HydroGaugeDatabase extends Dexie {
   points!: Table<Point, string>
   ratings!: Table<Rating, string>
   compares!: Table<Compare, string>
+  ratingVersions!: Table<RatingVersion, string>
 
   constructor() {
     super(DB_NAME)
@@ -64,7 +67,7 @@ class HydroGaugeDatabase extends Dexie {
     })
 
     // v2：补齐筛选与统计需要的索引（河名/集水面积、水位、测法、偏差判定）
-    this.version(DB_VERSION)
+    this.version(2)
       .stores({
         stations: 'id, name, river, sectionCode, catchmentKm2, updatedAt',
         sections: 'id, stationId, measureNo, method, stageM, measuredAt, updatedAt',
@@ -93,6 +96,54 @@ class HydroGaugeDatabase extends Dexie {
               if (typeof row.updatedAt !== 'number') row.updatedAt = row.createdAt
               Object.assign(row, defaults())
             })
+        }
+      })
+
+    // v3：涨落标记（涨水/落水）+ 定线发布版本
+    this.version(DB_VERSION)
+      .stores({
+        stations: 'id, name, river, sectionCode, catchmentKm2, updatedAt',
+        sections: 'id, stationId, measureNo, method, stageM, riseFall, measuredAt, updatedAt',
+        verticals: 'id, sectionId, no, startDistanceM, depthM, updatedAt',
+        points: 'id, verticalId, relativeDepth, velocityMs, updatedAt',
+        ratings: 'id, stationId, lineNo, riseFall, stageM, flowM3s, measureNo, measuredAt, updatedAt',
+        compares: 'id, ratingId, verdict, deviationPct, comparedAt, updatedAt',
+        ratingVersions: 'id, lineNo, version, publishedAt, updatedAt'
+      })
+      .upgrade(async (tx) => {
+        // 迁移：为历史数据补涨落标记。
+        // 按测流时间排序后与前一测次水位比较：上涨→涨水，下落→落水；
+        // 测次过少或水位持平的无法判定，留空交人定。
+        const stations = await tx.table('stations').toArray()
+        for (const station of stations) {
+          const sections = await tx
+            .table('sections')
+            .where('stationId')
+            .equals(station.id)
+            .sortBy('measuredAt')
+          for (let i = 0; i < sections.length; i += 1) {
+            let riseFall: RiseFall | null = null
+            if (i > 0) {
+              const prev = sections[i - 1] as Section
+              const cur = sections[i] as Section
+              if (cur.stageM > prev.stageM) riseFall = 'rising'
+              else if (cur.stageM < prev.stageM) riseFall = 'falling'
+            }
+            await tx.table('sections').update(sections[i].id, { riseFall })
+          }
+        }
+
+        // 点据按测次号继承涨落标记（测次是涨落标记的唯一来源）
+        const sections = (await tx.table('sections').toArray()) as Section[]
+        const sectionByMeasureNo = new Map<string, Section>()
+        sections.forEach((section) => {
+          if (section.measureNo) sectionByMeasureNo.set(section.measureNo, section)
+        })
+        const ratings = (await tx.table('ratings').toArray()) as Rating[]
+        for (const rating of ratings) {
+          const section = sectionByMeasureNo.get(rating.measureNo)
+          const riseFall: RiseFall | null = section?.riseFall ?? null
+          await tx.table('ratings').update(rating.id, { riseFall })
         }
       })
   }
@@ -155,6 +206,7 @@ export async function seedDemoData(): Promise<void> {
           startDistanceM: 12.5,
           stageM: 5.42,
           method: '流速仪',
+          riseFall: 'rising',
           measuredAt: '2024-06-12T08:30:00.000Z'
         },
         {
@@ -164,7 +216,18 @@ export async function seedDemoData(): Promise<void> {
           startDistanceM: 12.5,
           stageM: 6.15,
           method: 'ADCP',
+          riseFall: 'rising',
           measuredAt: '2024-07-18T09:10:00.000Z'
+        },
+        {
+          id: 'sec_lh_2408',
+          stationId: 'stn_lh01',
+          measureNo: '2024-08-007',
+          startDistanceM: 12.5,
+          stageM: 6.85,
+          method: 'ADCP',
+          riseFall: 'falling',
+          measuredAt: '2024-08-10T09:20:00.000Z'
         }
       ],
       verticals: [
@@ -203,6 +266,7 @@ export async function seedDemoData(): Promise<void> {
           startDistanceM: 4.2,
           stageM: 3.18,
           method: '浮标',
+          riseFall: 'rising',
           measuredAt: '2024-05-22T07:50:00.000Z'
         },
         {
@@ -212,6 +276,7 @@ export async function seedDemoData(): Promise<void> {
           startDistanceM: 4.2,
           stageM: 4.36,
           method: '流速仪',
+          riseFall: 'rising',
           measuredAt: '2024-08-09T06:40:00.000Z'
         }
       ],
@@ -251,6 +316,7 @@ export async function seedDemoData(): Promise<void> {
           startDistanceM: 18.0,
           stageM: 5.36,
           method: 'ADCP',
+          riseFall: null,
           measuredAt: '2024-06-20T10:05:00.000Z'
         }
       ],
@@ -269,22 +335,29 @@ export async function seedDemoData(): Promise<void> {
     }
   ]
 
-  // 水位流量关系点据：A 线为龙门站主定线，B 线为青矶站定线
+  // 水位流量关系点据：A 线为龙门站主定线（涨水 + 落水两支），B 线为青矶站定线
   const ratingSeeds: Array<Omit<Rating, 'createdAt' | 'updatedAt'>> = [
-    { id: 'rat_lh_a1', stationId: 'stn_lh01', stageM: 4.01, flowM3s: 97.5, lineNo: 'A', measureNo: '2024-04-001', measuredAt: '2024-04-08T08:00:00.000Z' },
-    { id: 'rat_lh_a2', stationId: 'stn_lh01', stageM: 4.52, flowM3s: 138.7, lineNo: 'A', measureNo: '2024-05-002', measuredAt: '2024-05-16T08:00:00.000Z' },
-    { id: 'rat_lh_a3', stationId: 'stn_lh01', stageM: 5.42, flowM3s: 217.2, lineNo: 'A', measureNo: '2024-06-001', measuredAt: '2024-06-12T08:30:00.000Z' },
-    { id: 'rat_lh_a4', stationId: 'stn_lh01', stageM: 6.15, flowM3s: 298.5, lineNo: 'A', measureNo: '2024-07-002', measuredAt: '2024-07-18T09:10:00.000Z' },
-    { id: 'rat_lh_a5', stationId: 'stn_lh01', stageM: 7.03, flowM3s: 428.1, lineNo: 'A', measureNo: '2024-08-006', measuredAt: '2024-08-21T08:20:00.000Z' },
-    { id: 'rat_qj_b1', stationId: 'stn_qj02', stageM: 2.84, flowM3s: 42.3, lineNo: 'B', measureNo: '2023-05-001', measuredAt: '2023-05-11T07:30:00.000Z' },
-    { id: 'rat_qj_b2', stationId: 'stn_qj02', stageM: 3.18, flowM3s: 56.1, lineNo: 'B', measureNo: '2024-05-003', measuredAt: '2024-05-22T07:50:00.000Z' },
-    { id: 'rat_qj_b3', stationId: 'stn_qj02', stageM: 3.72, flowM3s: 78.4, lineNo: 'B', measureNo: '2024-07-001', measuredAt: '2024-07-02T08:10:00.000Z' },
-    { id: 'rat_qj_b4', stationId: 'stn_qj02', stageM: 4.36, flowM3s: 115.6, lineNo: 'B', measureNo: '2024-08-004', measuredAt: '2024-08-09T06:40:00.000Z' },
+    // A 线涨水支
+    { id: 'rat_lh_a1', stationId: 'stn_lh01', stageM: 4.01, flowM3s: 97.5, lineNo: 'A', riseFall: 'rising', measureNo: '2024-04-001', measuredAt: '2024-04-08T08:00:00.000Z' },
+    { id: 'rat_lh_a2', stationId: 'stn_lh01', stageM: 4.52, flowM3s: 138.7, lineNo: 'A', riseFall: 'rising', measureNo: '2024-05-002', measuredAt: '2024-05-16T08:00:00.000Z' },
+    { id: 'rat_lh_a3', stationId: 'stn_lh01', stageM: 5.42, flowM3s: 217.2, lineNo: 'A', riseFall: 'rising', measureNo: '2024-06-001', measuredAt: '2024-06-12T08:30:00.000Z' },
+    { id: 'rat_lh_a4', stationId: 'stn_lh01', stageM: 6.15, flowM3s: 298.5, lineNo: 'A', riseFall: 'rising', measureNo: '2024-07-002', measuredAt: '2024-07-18T09:10:00.000Z' },
+    { id: 'rat_lh_a5', stationId: 'stn_lh01', stageM: 7.03, flowM3s: 428.1, lineNo: 'A', riseFall: 'rising', measureNo: '2024-08-006', measuredAt: '2024-08-21T08:20:00.000Z' },
+    // A 线落水支
+    { id: 'rat_lh_f1', stationId: 'stn_lh01', stageM: 6.85, flowM3s: 372.0, lineNo: 'A', riseFall: 'falling', measureNo: '2024-08-007', measuredAt: '2024-08-10T09:20:00.000Z' },
+    { id: 'rat_lh_f2', stationId: 'stn_lh01', stageM: 6.32, flowM3s: 305.4, lineNo: 'A', riseFall: 'falling', measureNo: '2024-08-009', measuredAt: '2024-08-24T08:40:00.000Z' },
+    { id: 'rat_lh_f3', stationId: 'stn_lh01', stageM: 5.61, flowM3s: 224.8, lineNo: 'A', riseFall: 'falling', measureNo: '2024-08-010', measuredAt: '2024-08-30T09:00:00.000Z' },
+    { id: 'rat_lh_f4', stationId: 'stn_lh01', stageM: 4.85, flowM3s: 148.6, lineNo: 'A', riseFall: 'falling', measureNo: '2024-09-002', measuredAt: '2024-09-06T08:50:00.000Z' },
+    // B 线青矶站（涨水支）
+    { id: 'rat_qj_b1', stationId: 'stn_qj02', stageM: 2.84, flowM3s: 42.3, lineNo: 'B', riseFall: 'rising', measureNo: '2023-05-001', measuredAt: '2023-05-11T07:30:00.000Z' },
+    { id: 'rat_qj_b2', stationId: 'stn_qj02', stageM: 3.18, flowM3s: 56.1, lineNo: 'B', riseFall: 'rising', measureNo: '2024-05-003', measuredAt: '2024-05-22T07:50:00.000Z' },
+    { id: 'rat_qj_b3', stationId: 'stn_qj02', stageM: 3.72, flowM3s: 78.4, lineNo: 'B', riseFall: 'rising', measureNo: '2024-07-001', measuredAt: '2024-07-02T08:10:00.000Z' },
+    { id: 'rat_qj_b4', stationId: 'stn_qj02', stageM: 4.36, flowM3s: 115.6, lineNo: 'B', riseFall: 'rising', measureNo: '2024-08-004', measuredAt: '2024-08-09T06:40:00.000Z' },
     // C 线：含两个明显偏离点，用于演示超限挂红与偏差分析
-    { id: 'rat_bs_c1', stationId: 'stn_bs03', stageM: 4.9, flowM3s: 168.0, lineNo: 'C', measureNo: '2024-05-004', measuredAt: '2024-05-28T09:00:00.000Z' },
-    { id: 'rat_bs_c2', stationId: 'stn_bs03', stageM: 5.36, flowM3s: 203.5, lineNo: 'C', measureNo: '2024-06-005', measuredAt: '2024-06-20T10:05:00.000Z' },
-    { id: 'rat_bs_c3', stationId: 'stn_bs03', stageM: 5.88, flowM3s: 325.0, lineNo: 'C', measureNo: '2024-07-007', measuredAt: '2024-07-25T09:30:00.000Z' },
-    { id: 'rat_bs_c4', stationId: 'stn_bs03', stageM: 6.44, flowM3s: 288.0, lineNo: 'C', measureNo: '2024-08-008', measuredAt: '2024-08-15T09:40:00.000Z' }
+    { id: 'rat_bs_c1', stationId: 'stn_bs03', stageM: 4.9, flowM3s: 168.0, lineNo: 'C', riseFall: null, measureNo: '2024-05-004', measuredAt: '2024-05-28T09:00:00.000Z' },
+    { id: 'rat_bs_c2', stationId: 'stn_bs03', stageM: 5.36, flowM3s: 203.5, lineNo: 'C', riseFall: null, measureNo: '2024-06-005', measuredAt: '2024-06-20T10:05:00.000Z' },
+    { id: 'rat_bs_c3', stationId: 'stn_bs03', stageM: 5.88, flowM3s: 325.0, lineNo: 'C', riseFall: 'rising', measureNo: '2024-07-007', measuredAt: '2024-07-25T09:30:00.000Z' },
+    { id: 'rat_bs_c4', stationId: 'stn_bs03', stageM: 6.44, flowM3s: 288.0, lineNo: 'C', riseFall: 'falling', measureNo: '2024-08-008', measuredAt: '2024-08-15T09:40:00.000Z' }
   ]
 
   await db.transaction(
@@ -316,16 +389,18 @@ export async function seedDemoData(): Promise<void> {
       )
       await db.ratings.bulkPut(ratingSeeds.map((rating) => ({ ...rating, ...stamp(rating) })))
 
-      // 比测记录：按定线拟合出曲线流量后计算偏差与判定，保证与页面展示一致
+      // 比测记录：按支线（定线号 + 涨落标记）拟合出曲线流量后计算偏差与判定
       const compares: Compare[] = []
-      const lineGroups = new Map<string, Array<{ stageM: number; flowM3s: number }>>()
+      const branchGroups = new Map<string, Array<{ stageM: number; flowM3s: number }>>()
       ratingSeeds.forEach((rating) => {
-        const list = lineGroups.get(rating.lineNo) ?? []
+        const key = `${rating.lineNo}__${rating.riseFall ?? 'null'}`
+        const list = branchGroups.get(key) ?? []
         list.push({ stageM: rating.stageM, flowM3s: rating.flowM3s })
-        lineGroups.set(rating.lineNo, list)
+        branchGroups.set(key, list)
       })
       ratingSeeds.forEach((rating) => {
-        const fit = fitPowerCurve(lineGroups.get(rating.lineNo) ?? [], rating.lineNo)
+        const key = `${rating.lineNo}__${rating.riseFall ?? 'null'}`
+        const fit = fitPowerCurve(branchGroups.get(key) ?? [], rating.lineNo, rating.riseFall)
         if (!fit.valid) return
         const predicted = round(fit.a * Math.pow(Math.max(rating.stageM - fit.h0, 1e-6), fit.b), 2)
         const deviationPct = calcDeviationPct(rating.flowM3s, predicted)
@@ -375,7 +450,7 @@ export async function initDatabase(): Promise<void> {
 export async function clearAllTables(): Promise<void> {
   await db.transaction(
     'rw',
-    [db.stations, db.sections, db.verticals, db.points, db.ratings, db.compares],
+    [db.stations, db.sections, db.verticals, db.points, db.ratings, db.compares, db.ratingVersions],
     async () => {
       await Promise.all([
         db.stations.clear(),
@@ -383,7 +458,8 @@ export async function clearAllTables(): Promise<void> {
         db.verticals.clear(),
         db.points.clear(),
         db.ratings.clear(),
-        db.compares.clear()
+        db.compares.clear(),
+        db.ratingVersions.clear()
       ])
     }
   )
@@ -397,15 +473,16 @@ export async function resetDatabase(): Promise<void> {
 
 /** 统计各表行数，供页脚概览与导出页展示 */
 export async function countAll(): Promise<Record<string, number>> {
-  const [stations, sections, verticals, points, ratings, compares] = await Promise.all([
+  const [stations, sections, verticals, points, ratings, compares, ratingVersions] = await Promise.all([
     db.stations.count(),
     db.sections.count(),
     db.verticals.count(),
     db.points.count(),
     db.ratings.count(),
-    db.compares.count()
+    db.compares.count(),
+    db.ratingVersions.count()
   ])
-  return { stations, sections, verticals, points, ratings, compares }
+  return { stations, sections, verticals, points, ratings, compares, ratingVersions }
 }
 
 /** 写入结构版本号到 localStorage，便于导出页比对 */

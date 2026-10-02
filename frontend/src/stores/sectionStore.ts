@@ -189,6 +189,26 @@ export const useSectionStore = defineStore('section', () => {
 
   async function updateSection(id: string, patch: Partial<Section>): Promise<void> {
     await db.sections.update(id, { ...patch, updatedAt: Date.now() } as never)
+    // 涨落标记改动后，同步到同源测次号的关系点据，并触发所在支线重算
+    if (patch.riseFall !== undefined) {
+      const section = sections.value.find((item) => item.id === id)
+      if (section?.measureNo) {
+        const linkedRatings = await db.ratings.where('measureNo').equals(section.measureNo).toArray()
+        if (linkedRatings.length > 0) {
+          const now = Date.now()
+          await db.ratings.bulkPut(
+            linkedRatings.map((rating) => ({ ...rating, riseFall: patch.riseFall ?? null, updatedAt: now }))
+          )
+          // 触发所在定线号的支线重算（比测记录按新支线刷新）
+          const affectedLineNos = Array.from(new Set(linkedRatings.map((rating) => rating.lineNo)))
+          const { useRatingStore } = await import('@/stores/ratingStore')
+          const ratingStore = useRatingStore()
+          for (const lineNo of affectedLineNos) {
+            await ratingStore.rebuildCompares(lineNo)
+          }
+        }
+      }
+    }
   }
 
   async function removeSection(id: string): Promise<void> {

@@ -13,7 +13,7 @@ import {
 } from '@/utils/db'
 
 /** 备份集合键名 */
-export const BACKUP_KEYS = ['stations', 'sections', 'verticals', 'points', 'ratings', 'compares'] as const
+export const BACKUP_KEYS = ['stations', 'sections', 'verticals', 'points', 'ratings', 'compares', 'ratingVersions'] as const
 export type BackupKey = (typeof BACKUP_KEYS)[number]
 
 /** 各表行数统计（导出页展示与导入结果回执共用） */
@@ -21,13 +21,14 @@ export type CountMap = Record<BackupKey, number>
 
 /** 组装当前本地数据的完整快照 */
 export async function buildBackupPayload(): Promise<BackupPayload> {
-  const [stations, sections, verticals, points, ratings, compares] = await Promise.all([
+  const [stations, sections, verticals, points, ratings, compares, ratingVersions] = await Promise.all([
     db.stations.toArray(),
     db.sections.toArray(),
     db.verticals.toArray(),
     db.points.toArray(),
     db.ratings.toArray(),
-    db.compares.toArray()
+    db.compares.toArray(),
+    db.ratingVersions.toArray()
   ])
   return {
     app: 'gbhydrogaug',
@@ -38,7 +39,8 @@ export async function buildBackupPayload(): Promise<BackupPayload> {
     verticals,
     points,
     ratings,
-    compares
+    compares,
+    ratingVersions
   }
 }
 
@@ -65,7 +67,8 @@ export function validateBackup(input: unknown): { ok: boolean; errors: string[];
     verticals: obj.verticals ?? [],
     points: obj.points ?? [],
     ratings: obj.ratings ?? [],
-    compares: obj.compares ?? []
+    compares: obj.compares ?? [],
+    ratingVersions: obj.ratingVersions ?? []
   }
   return { ok: true, errors, payload }
 }
@@ -78,7 +81,8 @@ export function countPayload(payload: BackupPayload): CountMap {
     verticals: payload.verticals.length,
     points: payload.points.length,
     ratings: payload.ratings.length,
-    compares: payload.compares.length
+    compares: payload.compares.length,
+    ratingVersions: payload.ratingVersions.length
   }
 }
 
@@ -116,7 +120,7 @@ export async function importBackup(payload: BackupPayload, overwrite: boolean): 
   if (overwrite) await clearAllTables()
   await db.transaction(
     'rw',
-    [db.stations, db.sections, db.verticals, db.points, db.ratings, db.compares],
+    [db.stations, db.sections, db.verticals, db.points, db.ratings, db.compares, db.ratingVersions],
     async () => {
       await db.stations.bulkPut(payload.stations)
       await db.sections.bulkPut(payload.sections)
@@ -124,6 +128,7 @@ export async function importBackup(payload: BackupPayload, overwrite: boolean): 
       await db.points.bulkPut(payload.points)
       await db.ratings.bulkPut(payload.ratings)
       await db.compares.bulkPut(payload.compares)
+      await db.ratingVersions.bulkPut(payload.ratingVersions)
     }
   )
   return countPayload(payload)
@@ -166,11 +171,16 @@ export function remapIds(payload: BackupPayload): BackupPayload {
     id: createId('cmp'),
     ratingId: ratingMap.get(compare.ratingId) ?? compare.ratingId
   }))
-  return { ...payload, stations, sections, verticals, points, ratings, compares }
+  const ratingVersions = payload.ratingVersions.map((version) => ({
+    ...version,
+    id: createId('rver')
+  }))
+  return { ...payload, stations, sections, verticals, points, ratings, compares, ratingVersions }
 }
 
 /**
  * 生成结论文本：按测站输出最新水位、断面测次、定线参数与超限点据。
+ * 定线成果按（定线号 + 涨落支线）分别给出。
  * 供导出页的「检测结论」区域使用。
  */
 export interface ConclusionLine {
@@ -186,7 +196,7 @@ export interface ConclusionLine {
 
 export function buildConclusionLines(
   payload: BackupPayload,
-  fits: Array<{ lineNo: string; valid: boolean; a: number; b: number; h0: number; meanResidualPct: number; sampleCount: number }>
+  fits: Array<{ lineNo: string; riseFall: string | null; valid: boolean; a: number; b: number; h0: number; meanResidualPct: number; sampleCount: number }>
 ): ConclusionLine[] {
   return payload.stations.map((station) => {
     const sections = payload.sections.filter((section) => section.stationId === station.id)
@@ -201,9 +211,14 @@ export function buildConclusionLines(
     ).length
     const lines = Array.from(new Set(ratings.map((rating) => rating.lineNo)))
     const fitParts = lines.map((lineNo) => {
-      const fit = fits.find((item) => item.lineNo === lineNo)
-      if (!fit || !fit.valid) return `${lineNo} 线未定线`
-      return `${lineNo} 线 Q=${fit.a}·(H-${fit.h0})^${fit.b}，残差 ${fit.meanResidualPct}%（${fit.sampleCount} 点）`
+      const branchFits = fits.filter((item) => item.lineNo === lineNo)
+      if (branchFits.length === 0) return `${lineNo} 线未定线`
+      const branchText = branchFits.map((fit) => {
+        const branchLabel = fit.riseFall === 'rising' ? '涨水支' : fit.riseFall === 'falling' ? '落水支' : '未标记支'
+        if (!fit.valid) return `${branchLabel}未定线`
+        return `${branchLabel} Q=${fit.a}·(H-${fit.h0})^${fit.b}，残差 ${fit.meanResidualPct}%（${fit.sampleCount} 点）`
+      })
+      return `${lineNo} 线：${branchText.join('；')}`
     })
     return {
       stationId: station.id,
