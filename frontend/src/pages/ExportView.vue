@@ -32,7 +32,6 @@ import {
   remapIds,
   validateBackup
 } from '@/utils/export'
-import { fitPowerCurve } from '@/types/rating'
 
 const ratingStore = useRatingStore()
 const stationStore = useStationStore()
@@ -71,15 +70,7 @@ async function refreshCounts(): Promise<void> {
 
 async function buildConclusions(): Promise<void> {
   const payload = await buildBackupPayload()
-  const fits = ratingStore.lineNos.map((lineNo) =>
-    fitPowerCurve(
-      payload.ratings
-        .filter((rating) => rating.lineNo === lineNo)
-        .map((rating) => ({ stageM: rating.stageM, flowM3s: rating.flowM3s })),
-      lineNo
-    )
-  )
-  conclusions.value = buildConclusionLines(payload, fits)
+  conclusions.value = buildConclusionLines(payload, [])
 }
 
 async function handleExport(): Promise<void> {
@@ -149,10 +140,10 @@ async function handleReset(): Promise<void> {
 }
 
 async function refreshAll(): Promise<void> {
-  await ratingStore.rebuildCompares(ratingStore.activeLineNo)
+  const versionCount = await ratingStore.rebuildAllCompares()
   await refreshCounts()
   await buildConclusions()
-  ElMessage.success('已重新定线并刷新结构版本信息')
+  ElMessage.success(`已按涨 / 落两支重新拟合 ${versionCount} 组草稿，并刷新结构版本信息`)
 }
 
 onMounted(() => {
@@ -168,7 +159,7 @@ onMounted(() => {
       <div>
         <h2 class="page__title">比测偏差分析与导出</h2>
         <p class="gb-hint">
-          按测站输出检测结论（测次数、最新水位、定线参数、超限点据），并可导出 / 导入全量 JSON 备份。
+          按测站输出已发布版本的检测结论（涨 / 落支线、版本号、定线参数、超限点据），并可导出 / 导入全量 JSON 备份。
         </p>
       </div>
       <div class="page__actions">
@@ -234,7 +225,7 @@ onMounted(() => {
             <el-icon><Warning /></el-icon> {{ overLimitRows.length }} 条超限
           </el-tag>
         </h3>
-        <span class="gb-hint">偏差 = (曲线流量 − 实测流量) / 实测流量 × 100%，限值 {{ ratingStore.deviationLimitPct }}%</span>
+        <span class="gb-hint">清单仅取当前草稿或最新发布版；偏差按点据所在涨 / 落支线计算，限值 {{ ratingStore.deviationLimitPct }}%</span>
       </div>
 
       <EmptyPanel
@@ -248,9 +239,12 @@ onMounted(() => {
         <el-table-column label="测站" min-width="130">
           <template #default="{ row }">{{ row.stationName }}</template>
         </el-table-column>
-        <el-table-column label="定线号" width="90" align="center">
+        <el-table-column label="定线 / 支线 / 版本" width="150" align="center">
           <template #default="{ row }">
-            <el-tag size="small" effect="plain">{{ row.lineNo }}</el-tag>
+            <el-tag size="small" effect="plain">
+              {{ row.lineNo }} 线 · {{ row.branch }}支 ·
+              v{{ ratingStore.versions.find((version) => version.id === row.versionId)?.versionNo ?? '-' }}
+            </el-tag>
           </template>
         </el-table-column>
         <el-table-column label="水位 (m)" width="110" align="right">
@@ -290,7 +284,7 @@ onMounted(() => {
       <div class="gb-panel-title">
         <h3>全量 JSON 导入导出</h3>
         <span class="gb-hint">
-          导出内容包含 stations / sections / verticals / points / ratings / compares 六张表
+          导出内容包含 stations / sections / verticals / points / ratings / compares / ratingVersions 七张表
         </span>
       </div>
 
@@ -333,6 +327,9 @@ onMounted(() => {
         </el-descriptions-item>
         <el-descriptions-item label="点据 / 比测">
           {{ counts.ratings ?? 0 }} / {{ counts.compares ?? 0 }}
+        </el-descriptions-item>
+        <el-descriptions-item label="定线版本">
+          {{ counts.ratingVersions ?? 0 }} 版
         </el-descriptions-item>
         <el-descriptions-item label="最近备份时间">
           {{ lastBackupAt ? new Date(lastBackupAt).toLocaleString('zh-CN') : '尚未备份' }}

@@ -14,7 +14,7 @@ import EmptyPanel from '@/components/common/EmptyPanel.vue'
 import RouteMissingPanel from '@/components/common/RouteMissingPanel.vue'
 import { useStationStore } from '@/stores/stationStore'
 import { useSectionStore } from '@/stores/sectionStore'
-import { MEASURE_METHODS, type MeasureMethod, type Section } from '@/types/section'
+import { STAGE_TRENDS, MEASURE_METHODS, type MeasureMethod, type Section, type StageTrend } from '@/types/section'
 import { initDatabase } from '@/utils/db'
 
 const route = useRoute()
@@ -33,6 +33,7 @@ const form = reactive({
   startDistanceM: 0,
   stageM: 0,
   method: '流速仪' as MeasureMethod,
+  stageTrend: '涨水' as StageTrend,
   measuredAt: new Date().toISOString().slice(0, 16)
 })
 
@@ -81,6 +82,7 @@ function openCreate(): void {
   form.startDistanceM = stats.value.latest?.startDistanceM ?? 0
   form.stageM = stats.value.latest?.stageM ?? 0
   form.method = '流速仪'
+  form.stageTrend = '涨水'
   form.measuredAt = new Date().toISOString().slice(0, 16)
   dialogVisible.value = true
 }
@@ -91,6 +93,7 @@ function openEdit(section: Section): void {
   form.startDistanceM = section.startDistanceM
   form.stageM = section.stageM
   form.method = section.method
+  form.stageTrend = section.stageTrend ?? '待判'
   form.measuredAt = section.measuredAt.slice(0, 16)
   dialogVisible.value = true
 }
@@ -120,6 +123,7 @@ async function submitForm(): Promise<void> {
       startDistanceM: form.startDistanceM,
       stageM: form.stageM,
       method: form.method,
+      stageTrend: form.stageTrend,
       measuredAt: new Date(form.measuredAt).toISOString()
     }
     if (editingId.value) {
@@ -274,6 +278,13 @@ onMounted(() => {
 
       <el-table v-else :data="sectionRows" border stripe class="gb-table-compact">
         <el-table-column prop="measureNo" label="测次号" min-width="150" />
+        <el-table-column label="涨落" width="92" align="center">
+          <template #default="{ row }">
+            <el-tag size="small" :type="row.stageTrend === '涨水' ? 'success' : row.stageTrend === '落水' ? 'warning' : 'info'" effect="plain">
+              {{ row.stageTrend ?? '待判' }}
+            </el-tag>
+          </template>
+        </el-table-column>
         <el-table-column label="测法" width="110">
           <template #default="{ row }">
             <el-tag size="small" :type="row.method === 'ADCP' ? 'success' : row.method === '浮标' ? 'warning' : 'primary'" effect="plain">
@@ -317,7 +328,7 @@ onMounted(() => {
 
       <p class="gb-hint">
         <el-icon><Timer /></el-icon>
-        提示：测次的水位将参与水位流量关系点据定线；同一测次下的垂线按起点距升序参与部分面积法流量计算。
+        提示：巡测班须标明本趟为涨水或落水；资料室将按该标记把关系点据分入对应支线。分不出来的待判点据需人工确认。
       </p>
     </template>
 
@@ -329,6 +340,11 @@ onMounted(() => {
         <el-form-item label="测法" required>
           <el-radio-group v-model="form.method">
             <el-radio-button v-for="method in MEASURE_METHODS" :key="method" :value="method">{{ method }}</el-radio-button>
+          </el-radio-group>
+        </el-form-item>
+        <el-form-item label="本趟涨落" required>
+          <el-radio-group v-model="form.stageTrend">
+            <el-radio-button v-for="trend in STAGE_TRENDS" :key="trend" :value="trend">{{ trend }}</el-radio-button>
           </el-radio-group>
         </el-form-item>
         <el-form-item label="水位" required>

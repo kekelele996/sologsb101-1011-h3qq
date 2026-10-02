@@ -1,4 +1,5 @@
 import type { Rating } from './rating'
+import type { RatingBranch } from './section'
 
 /** 比测判定结论 */
 export type CompareVerdict = '合格' | '超限'
@@ -9,8 +10,12 @@ export const DEVIATION_LIMIT_PCT = 8
 /** 比测记录：实测流量与曲线流量的偏差分析 */
 export interface Compare {
   id: string
+  /** 所属定线版本；草稿记录用于当前重算，历史版本仍保留各自比测结论 */
+  versionId: string
   /** 被比测的关系点据 */
   ratingId: string
+  /** 点据所在的涨 / 落支线 */
+  branch: RatingBranch
   /** 实测流量（m³/s） */
   measuredFlow: number
   /** 曲线流量（m³/s） */
@@ -44,4 +49,6 @@ export interface CompareRow {
   rating: Rating | null
   stationName: string
   lineNo: string
+  branch: RatingBranch
+  versionId: string
 }

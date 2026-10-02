@@ -1,3 +1,5 @@
+import type { RatingBranch, StageTrend } from './section'
+
 /** 水位流量关系点据：参与幂函数定线的实测点 */
 export interface Rating {
   id: string
@@ -7,8 +9,10 @@ export interface Rating {
   stageM: number
   /** 流量（m³/s） */
   flowM3s: number
-  /** 定线号：同一定线号的点据参与同一组拟合 */
+  /** 定线号：同一定线号下再按涨落水支线分别拟合 */
   lineNo: string
+  /** 涨水 / 落水 / 待判；待判点据单独列出交人确认，不参与自动拟合 */
+  stageTrend: StageTrend
   /** 点据来源测次号 */
   measureNo: string
   /** 点据时间 */
@@ -19,7 +23,10 @@ export interface Rating {
 
 /** 幂函数定线结果：Q = a * (H - H0)^b */
 export interface RatingFitResult {
+  /** 基础定线号，如 A */
   lineNo: string
+  /** 绳套曲线支线：涨水支 / 落水支 */
+  branch?: RatingBranch
   /** 系数 a */
   a: number
   /** 指数 b */
@@ -45,6 +52,7 @@ export interface RatingFilterState {
   keyword: string
   stationIds: string[]
   lineNos: string[]
+  branches: RatingBranch[]
   verdicts: Array<'合格' | '超限'>
 }
 
@@ -53,6 +61,7 @@ export function createEmptyRatingFilter(): RatingFilterState {
     keyword: '',
     stationIds: [],
     lineNos: [],
+    branches: [],
     verdicts: []
   }
 }
@@ -91,13 +100,15 @@ function fitWithBase(
  */
 export function fitPowerCurve(
   points: Array<{ stageM: number; flowM3s: number }>,
-  lineNo = 'A'
+  lineNo = 'A',
+  branch?: RatingBranch
 ): RatingFitResult {
   const usable = points.filter(
     (point) => Number.isFinite(point.stageM) && Number.isFinite(point.flowM3s) && point.flowM3s > 0
   )
   const base: RatingFitResult = {
     lineNo,
+    branch,
     a: 0,
     b: 0,
     h0: 0,
@@ -109,7 +120,7 @@ export function fitPowerCurve(
     message: ''
   }
   if (usable.length < 3) {
-    return { ...base, message: '点据少于 3 个，无法定线（至少需要 3 个实测点）' }
+    return { ...base, message: `${branch ?? ''}支点据少于 3 个，无法定线（至少需要 3 个实测点）`.trim() }
   }
   const stageMin = Math.min(...usable.map((point) => point.stageM))
   const stageMax = Math.max(...usable.map((point) => point.stageM))
@@ -146,6 +157,7 @@ export function fitPowerCurve(
   const valid = best.b > 0 && Number.isFinite(best.a)
   return {
     lineNo,
+    branch,
     a: Number(best.a.toFixed(4)),
     b: Number(best.b.toFixed(3)),
     h0: Number(best.h0.toFixed(3)),

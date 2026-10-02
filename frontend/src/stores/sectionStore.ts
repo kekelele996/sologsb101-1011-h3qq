@@ -5,8 +5,9 @@
 import { defineStore } from 'pinia'
 import { computed, ref } from 'vue'
 import { db, createId, watchTable } from '@/utils/db'
-import type { Section } from '@/types/section'
+import type { Section, StageTrend } from '@/types/section'
 import { createEmptySectionFilter, type SectionFilterState } from '@/types/section'
+import { useRatingStore } from '@/stores/ratingStore'
 import type { Vertical } from '@/types/vertical'
 import { buildRelativeDepths } from '@/types/vertical'
 import type { Point } from '@/types/point'
@@ -188,7 +189,18 @@ export const useSectionStore = defineStore('section', () => {
   }
 
   async function updateSection(id: string, patch: Partial<Section>): Promise<void> {
+    const previous = sections.value.find((section) => section.id === id) ?? null
     await db.sections.update(id, { ...patch, updatedAt: Date.now() } as never)
+
+    // 测次涨落标记改动后，来源于该测次的点据同步改支，并由定线 store 重算对应支线版本。
+    if (patch.stageTrend && previous && patch.stageTrend !== previous.stageTrend) {
+      const next: Pick<Section, 'stationId' | 'measureNo' | 'stageTrend'> = {
+        stationId: previous.stationId,
+        measureNo: previous.measureNo,
+        stageTrend: patch.stageTrend as StageTrend
+      }
+      await useRatingStore().syncRatingsForSection(next)
+    }
   }
 
   async function removeSection(id: string): Promise<void> {
